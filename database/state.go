@@ -12,12 +12,13 @@ import (
 )
 
 type Account string
+type Snapshot [32]byte
 
 type State struct {
-	Balances  map[Account]uint
-	txMempool []Tx
-
-	dbFile *os.File
+	Balances        map[Account]uint
+	txMempool       []Tx
+	dbFile          *os.File
+	latestBlockHash Hash
 }
 
 func (s *State) apply(tx *Tx) error {
@@ -36,7 +37,23 @@ func (s *State) apply(tx *Tx) error {
 	return nil
 }
 
-func (s *State) Add(tx *Tx) error {
+func (s *State) AddBlock(b *Block) error {
+	for i := range b.TXs {
+		s.AddTx(&b.TXs[i])
+	}
+
+	return nil
+}
+
+func (s *State) applyBlock(b *Block) error {
+	for i := range b.TXs {
+		s.apply(&b.TXs[i])
+	}
+
+	return nil
+}
+
+func (s *State) AddTx(tx *Tx) error {
 	if err := s.apply(tx); err != nil {
 		return err
 	}
@@ -48,22 +65,34 @@ func (s *State) Close() error {
 	return s.dbFile.Close()
 }
 
-func (s *State) Persist() error {
-	mempool := make([]Tx, len(s.txMempool))
-	copy(mempool, s.txMempool)
+func (s *State) Persist() (Hash, error) {
+	block := NewBlock(
+		s.latestBlockHash,
+		uint64(time.Now().Unix()),
+		s.txMempool,
+	)
 
-	for idx := range mempool {
-		bytes, err := json.Marshal(mempool[idx])
-		if err != nil {
-			return err
-		}
-		if _, err := s.dbFile.Write(append(bytes, '\n')); err != nil {
-			return err
-		}
-		s.txMempool = s.txMempool[1:]
+	blockHash, err := block.Hash()
+	if err != nil {
+		return Hash{}, nil
 	}
 
-	return nil
+	s.latestBlockHash = blockHash
+
+	blockFs := BlockFS{blockHash, block}
+	blockFsJson, err := json.Marshal(blockFs)
+	if err != nil {
+		return Hash{}, nil
+	}
+
+	if _, err := s.dbFile.Write(append(blockFsJson, '\n')); err != nil {
+		return Hash{}, err
+	}
+
+	s.latestBlockHash = blockHash
+	s.txMempool = []Tx{}
+
+	return s.latestBlockHash, nil
 }
 
 type Genesis struct {
@@ -95,7 +124,7 @@ func NewStateFromDisk() (*State, error) {
 		log.Fatal(err)
 	}
 
-	txFilePath := filepath.Join(cwd, "database", "tx.db")
+	txFilePath := filepath.Join(cwd, "database", "block.db")
 	file, err := os.OpenFile(txFilePath, os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		log.Fatal(err)
@@ -109,13 +138,14 @@ func NewStateFromDisk() (*State, error) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		var tx Tx
-		if err = json.Unmarshal(scanner.Bytes(), &tx); err != nil {
+		var blockFS BlockFS
+		if err = json.Unmarshal(scanner.Bytes(), &blockFS); err != nil {
 			log.Fatal(err)
 		}
-		if err = state.apply(&tx); err != nil {
+		if err = state.applyBlock(blockFS.Block); err != nil {
 			return nil, err
 		}
+		state.latestBlockHash = blockFS.Hash
 	}
 
 	return state, nil
